@@ -1,9 +1,10 @@
 """Components wrapped in a higher-order call (forwardRef, memo, ...) get Function nodes (#972)."""
 
-from pathlib import Path
+import time
+from pathlib import Path, PureWindowsPath
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import full_build
+from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.parser import CodeParser
 from code_review_graph.tools.query import query_graph
 
@@ -591,3 +592,514 @@ def test_a_component_built_in_a_test_body_keeps_its_calls_on_the_test(tmp_path):
     result = query_graph("tests_for", f"{production.as_posix()}::useForkRef", repo_root=str(repo))
     assert result["status"] == "ok"
     assert {node["name"] for node in result["results"]} == tested
+
+
+# --- Edge cases added while hardening #972 for staging ---------------------------
+
+
+def _all_pairs(path: Path, edges, kinds=("CALLS", "REFERENCES")):
+    prefix = f"{path.resolve().as_posix()}::"
+    return {
+        (
+            edge.kind,
+            edge.source.replace(prefix, "").rsplit("/", 1)[-1],
+            edge.target.replace(prefix, "").rsplit("::", 1)[-1].rsplit("/", 1)[-1],
+        )
+        for edge in edges
+        if edge.kind in kinds
+    }
+
+
+def test_let_and_var_declarations_are_unwrapped_like_const(tmp_path):
+    """`let` and `var` are a `lexical_declaration` / `variable_declaration` like `const`."""
+    path, (nodes, edges) = _parse(
+        tmp_path,
+        "legacy.jsx",
+        "let Card = memo(() => paint());\nvar Input = forwardRef((props, ref) => focus());\n",
+    )
+
+    functions = _functions(nodes)
+    assert set(functions) == {"Card", "Input"}
+    assert functions["Input"].params == "(props, ref)"
+    assert ("Card", "paint") in _call_pairs(path, edges)
+    assert ("Input", "focus") in _call_pairs(path, edges)
+
+
+def test_a_wrapper_without_a_function_literal_is_not_a_definition(tmp_path):
+    """`memo()`, `memo(Button)` and `memo(...parts)` do not receive a function literal.
+
+    `memo(Button)` is the most common form of all, and the component is `Button`, which
+    already has its own node. None of these become a definition, and the wrapper calls
+    and the reference to `Button` stay where the declaration is.
+    """
+    path, (nodes, edges) = _parse(
+        tmp_path,
+        "memoized.jsx",
+        "function Button() { return null; }\n"
+        "function setup(parts) {\n"
+        "  const Empty = memo();\n"
+        "  const NoRef = forwardRef();\n"
+        "  const MemoButton = memo(Button);\n"
+        "  const Spread = memo(...parts);\n"
+        "  return [Empty, NoRef, MemoButton, Spread];\n"
+        "}\n",
+    )
+
+    assert set(_functions(nodes)) == {"Button", "setup"}
+    assert _all_pairs(path, edges) == {
+        ("CALLS", "setup", "memo"),
+        ("CALLS", "setup", "forwardRef"),
+        ("REFERENCES", "setup", "Button"),
+    }
+
+
+def test_shapes_the_unwrapping_does_not_read_stay_plain_calls(tmp_path):
+    """Forms outside the documented ones keep their staging behaviour.
+
+    No declarator name (`export default memo(fn)`, destructuring), a value that is not
+    an arrow or function expression (generator, parenthesised), an expression around
+    the call (`as FC`), a tagged template instead of an argument list
+    (`styled(Base)\\`...\\``) and a member callee that is not `React` (`styled.div(fn)`):
+    none is a definition, and every call stays in the enclosing scope.
+    """
+    path, (nodes, edges) = _parse(
+        tmp_path,
+        "shapes.tsx",
+        "export default memo(() => first());\n"
+        "export function setup() {\n"
+        "  const { A } = memo(() => second());\n"
+        "  const [B] = forwardRef(() => third());\n"
+        "  const C = memo(function* () { yield fourth(); });\n"
+        "  const D = memo((() => fifth()));\n"
+        "  const E = memo(() => sixth()) as FC;\n"
+        "  const F = styled(Base)`color: red;`;\n"
+        "  const G = styled.div(() => seventh());\n"
+        "  return [A, B, C, D, E, F, G];\n"
+        "}\n",
+    )
+
+    assert set(_functions(nodes)) == {"setup"}
+    module = path.resolve().as_posix()
+    pairs = _call_pairs(path, edges)
+    assert {caller for caller, _ in pairs} == {module, "setup"}
+    assert (module, "first") in pairs
+    inner = ("second", "third", "fourth", "fifth", "sixth", "seventh")
+    assert {("setup", callee) for callee in inner} <= pairs
+
+
+def test_a_component_wrapped_inside_another_has_the_outer_as_its_caller(tmp_path):
+    """A wrapped component declared in another one's body: the inner wrapper runs in the
+    outer component, the inner component's body belongs to the inner one, and the outer
+    wrapper stays at module scope."""
+    path, (nodes, edges) = _parse(
+        tmp_path,
+        "nested.jsx",
+        "export const Outer = memo(() => {\n"
+        "  const Inner = forwardRef(() => paint());\n"
+        "  return <Inner />;\n"
+        "});\n",
+    )
+
+    functions = _functions(nodes)
+    assert set(functions) == {"Outer", "Inner"}
+    assert (functions["Outer"].line_start, functions["Outer"].line_end) == (1, 4)
+    assert (functions["Inner"].line_start, functions["Inner"].line_end) == (2, 2)
+    assert _call_pairs(path, edges) == {
+        (path.resolve().as_posix(), "memo"),
+        ("Outer", "forwardRef"),
+        ("Outer", "Inner"),
+        ("Inner", "paint"),
+    }
+
+
+def test_a_wrapped_component_in_a_class_method_belongs_to_the_class(tmp_path):
+    """Inside a method the component is qualified under the class, as a directly
+    assigned function is, and the wrapper call stays on the method."""
+    path, (nodes, edges) = _parse(
+        tmp_path,
+        "page.jsx",
+        "class Page {\n"
+        "  render() {\n"
+        "    const Row = memo(() => paint());\n"
+        "    return Row;\n"
+        "  }\n"
+        "}\n",
+    )
+
+    functions = _functions(nodes)
+    assert set(functions) == {"render", "Row"}
+    assert functions["Row"].parent_name == "Page"
+    prefix = path.resolve().as_posix()
+    assert any(
+        edge.kind == "CONTAINS"
+        and edge.source == f"{prefix}::Page"
+        and edge.target == f"{prefix}::Page.Row"
+        for edge in edges
+    )
+    assert _call_pairs(path, edges) == {("Page.render", "memo"), ("Page.Row", "paint")}
+
+
+def test_unicode_names_and_a_path_with_spaces(tmp_path):
+    """Identifiers and paths are decoded as UTF-8: the qualified name keeps both."""
+    folder = tmp_path / "dir with spaces é"
+    folder.mkdir()
+    path, (nodes, edges) = _parse(
+        folder,
+        "Ünïcødé Card.jsx",
+        "export const Kärtchen = memo(() => paint());\n"
+        "export const Opt = React?.memo(async () => { await draw(); });\n",
+    )
+
+    assert set(_functions(nodes)) == {"Kärtchen", "Opt"}
+    qualified = f"{path.as_posix()}::Kärtchen"
+    assert any(edge.kind == "CONTAINS" and edge.target == qualified for edge in edges)
+    assert {("Kärtchen", "paint"), ("Opt", "draw")} <= _call_pairs(path, edges)
+
+
+def test_a_syntax_error_in_a_wrapped_component_does_not_raise(tmp_path):
+    """Half-typed source reaches the parser from watch mode; it must not raise."""
+    _path, (nodes, _edges) = _parse(
+        tmp_path,
+        "broken.tsx",
+        "export const Broken = memo((props) => {\n  paint(\n"
+        "export const Half = forwardRef<HTMLDivElement,\n",
+    )
+
+    assert isinstance(nodes, list)
+
+
+def test_a_windows_style_path_keeps_test_bodies_and_module_components_apart(tmp_path):
+    """The test-body check compares qualified names, which normalise the separators.
+
+    With a backslash path a probe built in `it()` is still the test's, and a component
+    at module scope of the same test file is still indexed under a POSIX identity.
+    """
+    nodes, edges = CodeParser().parse_bytes(
+        PureWindowsPath(r"C:\repo\src\Probe.test.tsx"),
+        b"export const Frame = React.memo(() => <div>{useForkRef(null)}</div>);\n"
+        b"describe('d', () => {\n"
+        b"  it('t', () => {\n"
+        b"    const P = React.forwardRef((p, r) => useForkRef(r));\n"
+        b"    render(<P />);\n"
+        b"  });\n"
+        b"});\n",
+    )
+
+    assert {node.name for node in nodes if node.kind == "Function"} == {"Frame"}
+    assert all("\\" not in node.file_path for node in nodes)
+    useforkref_callers = {
+        edge.source.rsplit("::", 1)[-1]
+        for edge in edges
+        if edge.kind == "CALLS" and edge.target == "useForkRef"
+    }
+    assert useforkref_callers == {"Frame", "it:t@L3"}
+
+
+def test_probes_in_every_test_runner_body_stay_the_tests(tmp_path):
+    """`beforeEach`, `it.each(...)(...)` and `test()` bodies are test bodies too.
+
+    Their probes are not indexed and every TESTED_BY edge staging mints is still
+    minted, so `tests_for(target)` keeps the hooks and tests that exercise it.
+    """
+    repo = tmp_path.resolve()
+    test_file = repo / "probe.test.jsx"
+    test_file.write_text(
+        "describe('d', () => {\n"
+        "  beforeEach(() => {\n"
+        "    const P = memo(() => target());\n"
+        "  });\n"
+        "  it.each([1])('e %s', () => {\n"
+        "    const Q = forwardRef(() => target());\n"
+        "  });\n"
+        "  test('t', () => {\n"
+        "    const R = React.memo(() => target());\n"
+        "  });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    nodes, edges = CodeParser(repo).parse_file(test_file)
+
+    assert not _functions(nodes)
+    assert not {"P", "Q", "R"} & {node.name for node in nodes}
+    tested_by = {
+        edge.target.rsplit("::", 1)[-1]
+        for edge in edges
+        if edge.kind == "TESTED_BY" and edge.source == "target"
+    }
+    assert tested_by == {"beforeEach@L2", "describe:d@L1", "test:t@L8"}
+
+
+def test_a_helper_in_a_test_file_is_not_a_test_body(tmp_path):
+    """Only a test's own body is exempt. A plain helper function in a test file is not a
+    test, so a component it builds is indexed like anywhere else."""
+    repo = tmp_path.resolve()
+    test_file = repo / "helpers.test.jsx"
+    test_file.write_text(
+        "function renderProbe() {\n  const Probe = memo(() => target());\n  return Probe;\n}\n",
+        encoding="utf-8",
+    )
+
+    nodes, edges = CodeParser(repo).parse_file(test_file)
+
+    assert set(_functions(nodes)) == {"renderProbe", "Probe"}
+    assert _call_pairs(test_file, edges) == {("renderProbe", "memo"), ("Probe", "target")}
+
+
+def test_name_collisions_match_a_directly_assigned_function(tmp_path):
+    """Wrapped components share the identity rules of directly assigned functions.
+
+    Two functions that each declare `const Card` give both the same `<file>::Card`
+    identity, as `const Row = () => ...` always has. A wrapped declaration must not
+    invent a different scheme for the same collision.
+    """
+    wrapped_path, (wrapped_nodes, wrapped_edges) = _parse(
+        tmp_path,
+        "wrapped.jsx",
+        "function one() { const Card = memo(() => paint()); return Card; }\n"
+        "function two() { const Card = memo(() => draw()); return Card; }\n",
+    )
+    direct_path, (direct_nodes, direct_edges) = _parse(
+        tmp_path,
+        "direct.jsx",
+        "function one() { const Card = () => paint(); return Card; }\n"
+        "function two() { const Card = () => draw(); return Card; }\n",
+    )
+
+    def identities(nodes):
+        return sorted(
+            (node.kind, node.name, node.line_start) for node in nodes if node.kind == "Function"
+        )
+
+    assert identities(wrapped_nodes) == identities(direct_nodes)
+    body_calls = {("Card", "paint"), ("Card", "draw")}
+    assert body_calls <= _call_pairs(wrapped_path, wrapped_edges)
+    assert body_calls <= _call_pairs(direct_path, direct_edges)
+    assert _call_pairs(wrapped_path, wrapped_edges) - body_calls == {
+        ("one", "memo"),
+        ("two", "memo"),
+    }
+
+
+def test_parsing_twice_gives_the_same_graph(tmp_path):
+    """The chain list and the sibling walk are per call: nothing leaks between parses."""
+    path = tmp_path / "Card.tsx"
+    path.write_text(
+        "export function setup() {\n"
+        "  const Card: FC<Props> = memo(forwardRef<El, Props>((p, r) => paint()), eq),"
+        " token = nextToken();\n"
+        "  return [Card, token];\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    parser = CodeParser()
+
+    first = parser.parse_file(path)
+    second = parser.parse_file(path)
+
+    def shape(result):
+        nodes, edges = result
+        return (
+            sorted((n.kind, n.name, n.line_start, n.line_end, n.params) for n in nodes),
+            sorted((e.kind, e.source, e.target, e.line) for e in edges),
+        )
+
+    assert shape(first) == shape(second)
+    assert len(shape(first)[1]) == len(set(shape(first)[1]))
+
+
+_BUTTON_SOURCE = (
+    "import { forwardRef } from 'react';\n"
+    "import { track } from './track';\n"
+    "export const Button = forwardRef<HTMLButtonElement, Props>((props, ref) => {\n"
+    "  track('click');\n"
+    "  return <button ref={ref} {...props} />;\n"
+    "});\n"
+)
+
+
+def _write_issue_repo(repo: Path) -> None:
+    (repo / "src").mkdir()
+    (repo / "src" / "track.ts").write_text(
+        "export function track(name: string) { return name; }\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "Button.tsx").write_text(_BUTTON_SOURCE, encoding="utf-8")
+    (repo / "src" / "Toolbar.tsx").write_text(
+        "import { Button } from './Button';\nexport const Toolbar = () => <Button>Save</Button>;\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "Button.test.tsx").write_text(
+        "import { Button } from './Button';\nit('renders', () => { render(<Button />); });\n",
+        encoding="utf-8",
+    )
+    (repo / ".code-review-graph").mkdir()
+
+
+def _dangling_calls(store: GraphStore) -> set[str]:
+    known = {node.qualified_name for node in store.get_all_nodes(exclude_files=False)}
+    return {
+        edge.target_qualified
+        for edge in store.get_all_edges()
+        if edge.kind == "CALLS"
+        and "::" in edge.target_qualified
+        and edge.target_qualified not in known
+    }
+
+
+def test_issue_971_end_to_end_through_the_graph(tmp_path, monkeypatch):
+    """The issue's repository, built and queried: the JSX use of `Button` lands on a node.
+
+    `callers_of(Button)` answers `Toolbar`, `tests_for(Button)` answers the test that
+    renders it, the call inside the component is the component's, and no CALLS edge
+    in the repository targets a qualified name that has no node.
+    """
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = tmp_path.resolve()
+    _write_issue_repo(repo)
+    button = f"{(repo / 'src' / 'Button.tsx').as_posix()}::Button"
+
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        assert full_build(repo, store)["errors"] == []
+        node = store.get_node(button)
+        assert node is not None and node.kind == "Function"
+        assert (node.line_start, node.line_end) == (3, 6)
+        assert _dangling_calls(store) == set()
+
+    callers = query_graph("callers_of", button, repo_root=str(repo))
+    assert callers["status"] == "ok"
+    assert {result["name"] for result in callers["results"]} == {"Toolbar", "it:renders@L2"}
+    tests = query_graph("tests_for", button, repo_root=str(repo))
+    assert {result["name"] for result in tests["results"]} == {"it:renders@L2"}
+    track = f"{(repo / 'src' / 'track.ts').as_posix()}::track"
+    track_callers = query_graph("callers_of", track, repo_root=str(repo))
+    assert {result["name"] for result in track_callers["results"]} == {"Button"}
+
+
+def test_an_incremental_update_replaces_a_renamed_wrapped_component(tmp_path, monkeypatch):
+    """Editing the file re-parses it like a full build: the old component and its edges
+    go, the renamed one arrives, and a second update with no change is a no-op."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = tmp_path.resolve()
+    _write_issue_repo(repo)
+    button_file = repo / "src" / "Button.tsx"
+    prefix = button_file.as_posix()
+
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        full_build(repo, store)
+        assert store.get_node(f"{prefix}::Button") is not None
+
+        button_file.write_text(
+            _BUTTON_SOURCE.replace("const Button = forwardRef", "const PrimaryButton = memo"),
+            encoding="utf-8",
+        )
+        incremental_update(repo, store, changed_files=["src/Button.tsx"])
+
+        assert store.get_node(f"{prefix}::Button") is None
+        renamed = store.get_node(f"{prefix}::PrimaryButton")
+        assert renamed is not None and renamed.kind == "Function"
+        assert not [
+            edge
+            for edge in store.get_edges_by_source(f"{prefix}::Button")
+            if edge.file_path == prefix
+        ]
+        sources = {
+            edge.source_qualified
+            for edge in store.get_all_edges()
+            if edge.file_path == prefix and edge.kind == "CALLS"
+        }
+        assert sources == {prefix, f"{prefix}::PrimaryButton"}
+        before = (len(store.get_all_nodes(exclude_files=False)), len(store.get_all_edges()))
+
+        second = incremental_update(repo, store, changed_files=[])
+        assert second["files_updated"] == 0
+        after = (len(store.get_all_nodes(exclude_files=False)), len(store.get_all_edges()))
+        assert after == before
+
+
+def test_a_graph_written_before_wrapped_components_gains_them(tmp_path, monkeypatch):
+    """A graph built by an earlier release has no node for a wrapped component.
+
+    That graph is simulated by building with the unwrapping switched off. The update
+    skips a file whose content hash is unchanged, so the node arrives when the file is
+    next edited, and the JSX edge that dangled then resolves. A full rebuild over the
+    old database gives the same graph as a fresh build.
+    """
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+
+    def graph(store, root):
+        prefix = root.as_posix()
+        nodes = sorted(
+            n.qualified_name.replace(prefix, "<repo>")
+            for n in store.get_all_nodes(exclude_files=False)
+        )
+        edges = sorted(
+            (e.kind, e.source_qualified.replace(prefix, "<repo>"), e.target_qualified)
+            for e in store.get_all_edges()
+        )
+        return nodes, [(k, s, t.replace(prefix, "<repo>")) for k, s, t in edges]
+
+    edited = _BUTTON_SOURCE + "// edited\n"
+    repo = (tmp_path / "old").resolve()
+    repo.mkdir()
+    _write_issue_repo(repo)
+    button = f"{(repo / 'src' / 'Button.tsx').as_posix()}::Button"
+
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        with monkeypatch.context() as old_release:
+            old_release.setattr(
+                CodeParser,
+                "_js_wrapped_function",
+                lambda self, *a, **k: None,
+                raising=False,
+            )
+            full_build(repo, store)
+        assert store.get_node(button) is None
+        assert button in _dangling_calls(store)
+
+        (repo / "src" / "Button.tsx").write_text(edited, encoding="utf-8")
+        incremental_update(repo, store, changed_files=["src/Button.tsx"])
+        assert store.get_node(button) is not None
+        assert _dangling_calls(store) == set()
+
+        full_build(repo, store)
+        rebuilt = graph(store, repo)
+
+    fresh_repo = (tmp_path / "fresh").resolve()
+    fresh_repo.mkdir()
+    _write_issue_repo(fresh_repo)
+    (fresh_repo / "src" / "Button.tsx").write_text(edited, encoding="utf-8")
+    with GraphStore(fresh_repo / ".code-review-graph" / "graph.db") as fresh:
+        full_build(fresh_repo, fresh)
+        assert rebuilt == graph(fresh, fresh_repo)
+
+
+def test_thousands_of_wrapped_components_in_one_scope(tmp_path):
+    """Each wrapped declaration checks for an enclosing test by scanning the nodes so far.
+
+    Thousands in one function are all indexed, thousands of probes in one `describe`
+    are all left to their tests, and neither takes long."""
+    count = 2000
+    in_function = (
+        "function setup() {\n"
+        + "".join(f"  const C{i} = memo(() => paint{i % 7}());\n" for i in range(count))
+        + "}\n"
+    )
+    in_tests = (
+        "describe('d', () => {\n"
+        + "".join(
+            f"  it('t{i}', () => {{ const P{i} = memo(() => target()); }});\n" for i in range(count)
+        )
+        + "});\n"
+    )
+    _path, (nodes, _edges) = _parse(tmp_path, "many.jsx", in_function)
+    assert len(_functions(nodes)) == count + 1
+
+    test_path = tmp_path / "many.test.jsx"
+    test_path.write_text(in_tests, encoding="utf-8")
+    start = time.perf_counter()
+    test_nodes, _ = CodeParser(tmp_path).parse_file(test_path)
+    elapsed = time.perf_counter() - start
+
+    assert not _functions(test_nodes)
+    assert elapsed < 20
