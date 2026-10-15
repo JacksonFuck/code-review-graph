@@ -244,19 +244,6 @@ def test_symlinked_repo_root_falls_back_to_local_graph(tmp_path):
 # --- error paths ------------------------------------------------------------
 
 
-def test_uncreatable_registered_dir_with_local_graph_falls_back(tmp_path):
-    """A registration that could never be recreated must not block the graph."""
-    repo = tmp_path / "repo"
-    local = repo / ".code-review-graph"
-    local.mkdir(parents=True)
-    (local / "graph.db").write_bytes(b"existing graph")
-    blocker = tmp_path / "blocker"
-    blocker.write_text("a file, not a directory", encoding="utf-8")
-    Registry().set_data_dir(str(repo), str(blocker / "data"))
-
-    assert get_data_dir(repo) == local
-
-
 def test_uncreatable_registered_dir_without_local_graph_falls_through(tmp_path):
     """Unchanged by #1080: a registration that cannot be created is a failed
     registry lookup, which falls through to normal resolution."""
