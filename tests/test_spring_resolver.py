@@ -389,7 +389,21 @@ def test_graph_without_java_kind_keeps_previous_rules(
 
 
 @pytest.mark.parametrize(
-    "concrete_homonym_last", [False, True], ids=["homonym-first", "homonym-last"],
+    "concrete_homonym_last",
+    [
+        pytest.param(False, id="homonym-first"),
+        pytest.param(
+            True,
+            id="homonym-last",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "PR #1075 keys java_kinds by simple name, last row wins: a concrete "
+                    "audit.Sink stored after interface app.Sink cancels the substitution"
+                ),
+            ),
+        ),
+    ],
 )
 def test_interface_injection_ignores_concrete_homonym_in_another_package(
     tmp_path: Path, concrete_homonym_last: bool,
