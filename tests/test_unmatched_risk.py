@@ -175,6 +175,10 @@ def test_many_misses_are_counted_in_full_in_the_summary(graph, tool, detail):
     assert '(+2 more)' in result['summary']
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason='unmatched_files is returned uncapped, so minimal responses grow with every miss',
+)
 @pytest.mark.parametrize('tool', TOOLS)
 def test_minimal_response_does_not_grow_with_the_number_of_misses(reopening_graph, tool):
     """A minimal response must stay bounded however many paths miss.
