@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,6 +21,30 @@ def isolate_mcp_state(monkeypatch):
     """Keep main() calls from leaking their default root or changing tool exposure."""
     monkeypatch.setattr(crg_main, "_default_repo_root", None)
     monkeypatch.delenv("CRG_TOOLS", raising=False)
+
+
+_REAL_SLEEP = time.sleep
+
+
+def _on_watch_tick(action):
+    """A ``time.sleep`` stand-in that acts only on ``watch()``'s own loop tick.
+
+    Patching ``time.sleep`` globally also catches ``subprocess``: with a
+    timeout, ``Popen.wait`` sleeps while a git child is still exiting, so on a
+    loaded machine a git call inside reconciliation or a batch would reach the
+    stand-in and end the watcher mid-update.  Every other caller sleeps for real.
+    """
+
+    def fake_sleep(seconds):
+        if sys._getframe(1).f_code is incremental.watch.__code__:
+            return action(seconds)
+        return _REAL_SLEEP(seconds)
+
+    return fake_sleep
+
+
+def _interrupt(_seconds):
+    raise KeyboardInterrupt
 
 
 def test_main_auto_watch_supplies_shared_postprocessing(tmp_path, monkeypatch):
@@ -117,7 +143,7 @@ def test_main_auto_watch_reconciliation_keeps_fts_consistent(tmp_path, monkeypat
     monkeypatch.setattr(crg_main.mcp, "run", Mock())
     with (
         patch("watchdog.observers.Observer") as observer,
-        patch("time.sleep", side_effect=KeyboardInterrupt),
+        patch("time.sleep", _on_watch_tick(_interrupt)),
     ):
         crg_main.main(repo_root=str(repo), auto_watch=True)
     observer.return_value.start.assert_called_once_with()
@@ -260,7 +286,7 @@ def test_mcp_auto_watch_event_batches_keep_fts_consistent(tmp_path, monkeypatch)
     monkeypatch.setattr(crg_main.mcp, "run", exercise_batches)
     with (
         patch("watchdog.observers.Observer", return_value=observer),
-        patch("time.sleep", side_effect=wait_for_batches),
+        patch("time.sleep", _on_watch_tick(wait_for_batches)),
     ):
         crg_main.main(repo_root=str(repo), auto_watch=True)
     assert observer.stopped
@@ -335,13 +361,25 @@ def _serve_through_startup_reconciliation(monkeypatch, repo, **main_kwargs):
     monkeypatch.setattr(crg_main.mcp, "run", serve)
     with (
         patch("watchdog.observers.Observer") as observer,
-        patch("time.sleep", side_effect=KeyboardInterrupt),
+        patch("time.sleep", _on_watch_tick(_interrupt)),
     ):
         crg_main.main(repo_root=str(repo), auto_watch=True, **main_kwargs)
     assert len(threads) == 1
     # The MCP transport still ran, whatever happened on the watcher thread.
     serve.assert_called_once()
     return observer
+
+
+def _assert_no_observer_left_running(observer):
+    """A watcher that stopped must not leave its observer running.
+
+    This does not pin whether the observer starts before or after startup
+    post-processing: starting it first is what keeps edits saved during that
+    post-processing from being missed.
+    """
+    started = observer.return_value.start.call_count
+    if started:
+        observer.return_value.stop.assert_called()
 
 
 def test_restart_without_changes_skips_postprocessing(tmp_path, monkeypatch):
@@ -417,8 +455,8 @@ def test_postprocess_warning_stops_watcher_loudly_and_server_keeps_serving(
     ):
         observer = _serve_through_startup_reconciliation(monkeypatch, repo)
 
-    # The failed batch ends the watcher before it starts observing ...
-    observer.assert_not_called()
+    # The failed batch ends the watcher without leaving an observer running ...
+    _assert_no_observer_left_running(observer)
     # ... and says so, rather than serving a frozen graph in silence.
     messages = [
         record.getMessage()
@@ -452,7 +490,7 @@ def test_postprocess_crash_ends_only_the_watcher_thread_and_stays_off_stdout(
 
     observer = _serve_through_startup_reconciliation(monkeypatch, repo)
 
-    observer.assert_not_called()
+    _assert_no_observer_left_running(observer)
     assert [(hook.thread.name, type(hook.exc_value)) for hook in seen] == [
         ("crg-watch", ValueError),
     ]
@@ -583,3 +621,279 @@ def test_reconciliation_with_unicode_and_spaces_in_paths(tmp_path, monkeypatch):
         assert _fts_drift(store) == (set(), set())
         for name in ("alphaHelper", "betaCaller", "gammaHelper"):
             assert _valid_matches(store, name) == 1, name
+
+
+# ---------------------------------------------------------------------------
+# Audit additions for #1108: the rest of the pipeline (flows, communities,
+# signatures), offline deletions, rename and directory-delete batches, stdout
+# on the success path, and a concurrent writer holding the lock.
+# ---------------------------------------------------------------------------
+
+
+def _derived_rows_reference_live_nodes(store):
+    """Return every flow/community row that points at a node no longer stored."""
+    conn = store._conn
+    node_ids = {row[0] for row in conn.execute("SELECT id FROM nodes")}
+    entry_ids = {row[0] for row in conn.execute("SELECT entry_point_id FROM flows")}
+    member_ids = {row[0] for row in conn.execute("SELECT node_id FROM flow_memberships")}
+    empty_communities = {
+        row[0] for row in conn.execute(
+            "SELECT c.id FROM communities c WHERE NOT EXISTS "
+            "(SELECT 1 FROM nodes n WHERE n.community_id = c.id)"
+        )
+    }
+    unknown_communities = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT n.community_id FROM nodes n "
+            "LEFT JOIN communities c ON c.id = n.community_id "
+            "WHERE n.community_id IS NOT NULL AND c.id IS NULL"
+        )
+    }
+    return {
+        "flow_entries": entry_ids - node_ids,
+        "flow_members": member_ids - node_ids,
+        "empty_communities": empty_communities,
+        "unknown_communities": unknown_communities,
+    }
+
+
+_NO_DANGLING = {
+    "flow_entries": set(),
+    "flow_members": set(),
+    "empty_communities": set(),
+    "unknown_communities": set(),
+}
+
+
+def _raw_fts_rowids(store, query):
+    """Every rowid the index answers for *query*, live node or not."""
+    return {
+        row[0] for row in store._conn.execute(
+            "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?", (query,),
+        )
+    }
+
+
+def test_auto_watch_refreshes_flows_communities_and_signatures(tmp_path, monkeypatch):
+    """FTS is one of five steps; the others must follow the batch too."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = _git_repo(tmp_path / "repo", {"mod.py": _ALPHA_BETA})
+    db_path = _healthy_graph(repo)
+    module = repo / "mod.py"
+    module.write_text(
+        module.read_text(encoding="utf-8")
+        + "\ndef gammaEntry(limit):\n    return alphaHelper() + limit\n",
+        encoding="utf-8",
+    )
+
+    _serve_through_startup_reconciliation(monkeypatch, repo)
+
+    with GraphStore(db_path) as store:
+        conn = store._conn
+        gamma = conn.execute(
+            "SELECT id, signature, community_id FROM nodes WHERE name = ?", ("gammaEntry",),
+        ).fetchone()
+        assert gamma is not None
+        assert gamma["signature"] and "gammaEntry" in gamma["signature"]
+        assert gamma["community_id"] is not None
+        flows = {
+            row[0]: row[1] for row in conn.execute(
+                "SELECT n.name, f.entry_point_id FROM flows f "
+                "JOIN nodes n ON n.id = f.entry_point_id"
+            )
+        }
+        assert flows.get("gammaEntry") == gamma["id"], flows
+        assert "betaCaller" in flows, flows
+        # Re-parsing mod.py gave every node in it a new ID: no flow or
+        # community row may still point at the old ones.
+        assert _derived_rows_reference_live_nodes(store) == _NO_DANGLING
+
+
+def test_offline_deletion_leaves_no_phantom_search_flow_or_community_rows(
+    tmp_path, monkeypatch,
+):
+    """A file removed while the server was down is purged from every derived table."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = _git_repo(
+        tmp_path / "repo",
+        {
+            "mod.py": _ALPHA_BETA,
+            "other.py": "def otherLeaf():\n    return 0\n\n"
+                        "def otherHelper():\n    return otherLeaf()\n",
+        },
+    )
+    db_path = _healthy_graph(repo)
+    with GraphStore(db_path) as store:
+        assert _raw_fts_rowids(store, "otherHelper")
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM flows WHERE name = ?", ("otherHelper",),
+        ).fetchone()[0] == 1
+    (repo / "other.py").unlink()
+
+    _serve_through_startup_reconciliation(monkeypatch, repo)
+
+    with GraphStore(db_path) as store:
+        assert not store.get_nodes_by_file(str(repo / "other.py"))
+        assert _fts_drift(store) == (set(), set())
+        assert _raw_fts_rowids(store, "otherHelper") == set()
+        assert _raw_fts_rowids(store, "otherLeaf") == set()
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM flows WHERE name = ?", ("otherHelper",),
+        ).fetchone()[0] == 0
+        assert _derived_rows_reference_live_nodes(store) == _NO_DANGLING
+        assert _valid_matches(store, "alphaHelper") == 1
+
+
+def test_mcp_auto_watch_rename_and_directory_delete_batches(tmp_path, monkeypatch):
+    """IDE renames (moved events) and `rm -rf dir` reach FTS and flows through MCP."""
+    from watchdog.events import DirDeletedEvent, FileMovedEvent
+
+    from tests.test_watch_robustness import FakeObserver
+
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = _git_repo(
+        tmp_path / "repo",
+        {
+            "mod.py": _ALPHA_BETA,
+            "oldmod.py": "def movedFn():\n    return 1\n",
+            "pkg/a.py": "def pkgLeaf():\n    return 1\n",
+            "pkg/b.py": "from pkg.a import pkgLeaf\n\n"
+                        "def pkgEntry():\n    return pkgLeaf()\n",
+        },
+    )
+    db_path = _healthy_graph(repo)
+
+    observer = FakeObserver()
+    ready = threading.Event()
+    stop = threading.Event()
+    threads = []
+    start_watch = incremental.start_watch_thread
+
+    def capture_thread(*args, **kwargs):
+        thread = start_watch(*args, **kwargs)
+        assert thread is not None
+        threads.append(thread)
+        return thread
+
+    def wait_for_batches(_seconds):
+        ready.set()
+        stop.wait(timeout=10)
+        raise KeyboardInterrupt
+
+    def exercise_batches(**kwargs):
+        try:
+            assert ready.wait(timeout=5), "watcher did not reach its post-startup loop"
+            handler = observer.handler
+            with GraphStore(db_path) as store:
+                old_path = repo / "oldmod.py"
+                new_path = repo / "renamedmod.py"
+                old_path.rename(new_path)
+                handler.process([FileMovedEvent(str(old_path), str(new_path))])
+                handler.raise_if_failed()
+                assert not store.get_nodes_by_file(str(old_path))
+                moved = [n for n in store.get_nodes_by_file(str(new_path)) if n.name == "movedFn"]
+                assert len(moved) == 1
+                assert _fts_drift(store) == (set(), set())
+                assert _raw_fts_rowids(store, "movedFn") == {moved[0].id}
+                assert _raw_fts_rowids(store, "file_path:oldmod") == set()
+                assert moved[0].id in _raw_fts_rowids(store, "file_path:renamedmod")
+
+                import shutil
+
+                shutil.rmtree(repo / "pkg")
+                handler.process([DirDeletedEvent(str(repo / "pkg"))])
+                handler.raise_if_failed()
+                for gone in ("pkgLeaf", "pkgEntry"):
+                    assert _raw_fts_rowids(store, gone) == set(), gone
+                assert store._conn.execute(
+                    "SELECT COUNT(*) FROM flows WHERE name = ?", ("pkgEntry",),
+                ).fetchone()[0] == 0
+                assert _fts_drift(store) == (set(), set())
+                assert _derived_rows_reference_live_nodes(store) == _NO_DANGLING
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "watcher did not stop after event batches"
+
+    monkeypatch.setattr(crg_main, "start_watch_thread", capture_thread)
+    monkeypatch.setattr(crg_main.mcp, "run", exercise_batches)
+    with (
+        patch("watchdog.observers.Observer", return_value=observer),
+        patch("time.sleep", _on_watch_tick(wait_for_batches)),
+    ):
+        crg_main.main(repo_root=str(repo), auto_watch=True)
+    assert observer.stopped
+
+
+def test_stdio_postprocessing_success_writes_nothing_to_stdout(tmp_path, monkeypatch, capfd):
+    """Stdio MCP owns fd 1: a successful watcher post-processing run stays off it."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = _git_repo(tmp_path / "repo", {"mod.py": _ALPHA_BETA})
+    db_path = _healthy_graph(repo)
+    capfd.readouterr()
+    module = repo / "mod.py"
+    module.write_text(module.read_text(encoding="utf-8") + _GAMMA, encoding="utf-8")
+
+    _serve_through_startup_reconciliation(monkeypatch, repo, transport="stdio")
+
+    assert capfd.readouterr().out == ""
+    with GraphStore(db_path) as store:
+        # Post-processing really ran on the watcher thread.
+        assert _fts_drift(store) == (set(), set())
+        assert _valid_matches(store, "gammaHelper") == 1
+
+
+def test_brief_lock_held_by_another_writer_does_not_stop_auto_watch(
+    tmp_path, monkeypatch, caplog,
+):
+    """A concurrent writer (say a hook's `update`) holding the lock briefly is waited out."""
+    import logging
+    import sqlite3
+
+    from code_review_graph import postprocessing
+
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = _git_repo(tmp_path / "repo", {"mod.py": _ALPHA_BETA})
+    db_path = _healthy_graph(repo)
+    module = repo / "mod.py"
+    module.write_text(module.read_text(encoding="utf-8") + _GAMMA, encoding="utf-8")
+    caplog.set_level(logging.WARNING)
+
+    locked = threading.Event()
+    released = threading.Event()
+    holders = []
+
+    def hold_write_lock():
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            locked.set()
+            time.sleep(1.0)
+            conn.commit()
+        finally:
+            conn.close()
+            released.set()
+
+    original_first_step = postprocessing._resolve_bare_endpoints
+
+    def first_step_under_contention(*args, **kwargs):
+        holder = threading.Thread(target=hold_write_lock, name="other-writer")
+        holders.append(holder)
+        holder.start()
+        assert locked.wait(timeout=5)
+        return original_first_step(*args, **kwargs)
+
+    monkeypatch.setattr(postprocessing, "_resolve_bare_endpoints", first_step_under_contention)
+
+    observer = _serve_through_startup_reconciliation(monkeypatch, repo)
+    for holder in holders:
+        holder.join(timeout=10)
+
+    assert len(holders) == 1 and released.is_set()
+    # The watcher got past post-processing and started observing.
+    observer.return_value.start.assert_called_once_with()
+    assert not [r for r in caplog.records if "Auto-watch for" in r.getMessage()]
+    with GraphStore(db_path) as store:
+        assert _fts_drift(store) == (set(), set())
+        assert _valid_matches(store, "gammaHelper") == 1
