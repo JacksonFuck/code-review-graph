@@ -158,14 +158,16 @@ def test_git_diff_update_preserves_reexport_callers(tmp_path):
 def test_watch_batches_one_file_at_a_time_reach_full_build_parity(built, order):
     """Watch delivers one save per batch and never reconciles stale files.
 
-    Whichever file the user saves first, the graph converges on a full build.
+    Whichever file the user saves first, the graph equals a full build of the
+    tree on disk after every save, not only once all three are saved: the user
+    can query between saves.
     """
     repo, store = built
     for name in order:
         _rename(repo, [name])
         result = incremental_update(repo, store, changed_files=[name], reconcile_stale=False)
         assert not result['errors']
-    _assert_matches_full_build(repo, store)
+        _assert_matches_full_build(repo, store)
 
 
 def test_mcp_update_tool_reports_reexport_callers_after_rename(tmp_path):
@@ -235,6 +237,8 @@ def test_body_only_seed_edit_leaves_graph_identical_to_full_build(built):
 
     assert not result['errors']
     assert sorted(result['dependent_files']) == ['client.ts', 'use.ts']
+    # Listed is not enough: the old update listed them too and skipped them.
+    assert result['files_updated'] == 3
     _assert_matches_full_build(repo, store)
 
 
@@ -336,7 +340,11 @@ def test_three_level_reexport_chain_keeps_callers(tmp_path):
 
 
 def test_python_reexport_rename_matches_full_build(tmp_path):
-    """Neighbouring language: Python aliases resolve through the same update."""
+    """Neighbouring language: Python aliases resolve through the same update.
+
+    Python resolves ``charge`` to ``pkg/barrel.py::charge``, so parity alone
+    holds even without the fix; the re-parse count is what pins it here.
+    """
     files = {
         'pkg/__init__.py': '',
         'pkg/fee.py': 'def calculate_fee(n):\n    return n + 2\n',
@@ -353,6 +361,8 @@ def test_python_reexport_rename_matches_full_build(tmp_path):
         result = incremental_update(repo, store, changed_files=['pkg/fee.py', 'pkg/barrel.py'])
 
         assert not result['errors']
+        assert sorted(result['dependent_files']) == ['pkg/barrel.py', 'pkg/use.py']
+        assert result['files_updated'] == 3
         _assert_matches_full_build(repo, store)
     finally:
         store.close()
@@ -452,4 +462,194 @@ def test_permission_error_on_seed_hash_does_not_crash_update(built):
     finally:
         seed.chmod(0o644)
     assert [e['file'] for e in result['errors']] == ['fee.ts']
+    # client.ts is reached only through fee.ts, so this fails if an unreadable
+    # seed is treated as a replay; use.ts alone is also reached via barrel.ts.
+    assert sorted(result['dependent_files']) == ['client.ts', 'use.ts']
+
+
+@pytest.fixture
+def committed(tmp_path):
+    repo = _repo(tmp_path / 'repo', BASE_FILES, commit=True)
+    store = GraphStore(tmp_path / 'graph.db')
+    assert not full_build(repo, store)['errors']
+    yield repo, store
+    store.close()
+
+
+def test_commit_hook_update_after_watch_saves_reparses_nothing(committed):
+    """Watch indexes each save; the post-commit ``update`` then sees the same bytes.
+
+    git still lists the renamed files against the stored anchor, but the graph
+    already holds them, so nothing is re-parsed and nothing is invalidated.
+    """
+    repo, store = committed
+    for name in RENAMED:
+        _rename(repo, [name])
+        saved = incremental_update(repo, store, changed_files=[name], reconcile_stale=False)
+        assert not saved['errors']
+    anchor = store.get_metadata('git_head_sha')
+    _git(repo, 'commit', '-qam', 'rename')
+
+    result = incremental_update(repo, store, base=anchor)
+
+    assert not result['errors']
+    assert sorted(result['changed_files']) == sorted(RENAMED)
+    assert result['dependent_files'] == []
+    assert result['files_updated'] == 0
+    _assert_matches_full_build(repo, store)
+
+
+def test_revert_found_only_by_content_scan_reparses_dependents(committed):
+    """Rename indexed by watch, then ``git checkout .``: git diff is empty.
+
+    Only the content scan reports the three files. use.ts was re-pointed at
+    ``computeFee`` by the watch batch, so it must be re-pointed back.
+    """
+    repo, store = committed
+    anchor = store.get_metadata('git_head_sha')
+    _rename(repo, RENAMED)
+    saved = incremental_update(repo, store, changed_files=list(RENAMED), reconcile_stale=False)
+    assert not saved['errors']
+    for name in RENAMED:
+        (repo / name).write_text(BASE_FILES[name], encoding='utf-8')
+
+    result = incremental_update(repo, store, base=anchor)
+
+    assert not result['errors']
+    assert sorted(result['changed_files']) == sorted(RENAMED)
     assert 'use.ts' in result['dependent_files']
+    assert _callers(store, repo, 'fee.ts', 'calculateFee') == {
+        str(repo / 'client.ts'), f'{repo / "use.ts"}::invoice',
+    }
+    _assert_matches_full_build(repo, store)
+
+
+@pytest.mark.parametrize('path', ['update', 'watch'])
+def test_moved_seed_file_keeps_reexport_callers(committed, path):
+    """fee.ts moves to lib/fee.ts; barrel.ts and client.ts follow, use.ts does not."""
+    repo, store = committed
+    anchor = store.get_metadata('git_head_sha')
+    (repo / 'lib').mkdir()
+    _git(repo, 'mv', 'fee.ts', 'lib/fee.ts')
+    for name in ('barrel.ts', 'client.ts'):
+        p = repo / name
+        p.write_text(
+            p.read_text(encoding='utf-8').replace('"./fee.js"', '"./lib/fee.js"'),
+            encoding='utf-8',
+        )
+
+    if path == 'update':
+        _git(repo, 'commit', '-qam', 'move')
+        result = incremental_update(repo, store, base=anchor)
+    else:
+        result = incremental_update(
+            repo, store,
+            changed_files=['fee.ts', 'lib/fee.ts', 'barrel.ts', 'client.ts'],
+            reconcile_stale=False,
+        )
+
+    assert not result['errors']
+    assert _callers(store, repo, 'lib/fee.ts', 'calculateFee') == {
+        str(repo / 'client.ts'), f'{repo / "use.ts"}::invoice',
+    }
+    _assert_matches_full_build(repo, store)
+
+
+def test_watch_save_reads_the_saved_file_at_most_twice(built, monkeypatch):
+    """The seed hash taken for the dependents check is reused by the parse loop.
+
+    One read to hash, one to parse, as before this change. unrelated.ts has no
+    importers, so no other file's parse reads it.
+    """
+    repo, store = built
+    monkeypatch.setenv('CRG_SERIAL_PARSE', '1')
+    (repo / 'unrelated.ts').write_text('export function unrelated() { return 43; }\n')
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self):
+        reads.append(Path(self).name)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', counting_read_bytes)
+    result = incremental_update(
+        repo, store, changed_files=['unrelated.ts'], reconcile_stale=False,
+    )
+
+    assert not result['errors']
+    assert result['files_updated'] == 1
+    assert reads.count('unrelated.ts') <= 2, reads
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Pre-existing: stale reconciliation drops fee.ts and its incoming edges '
+           'before the dependents lookup, so `update` never re-parses the importers.',
+)
+def test_deleted_seed_through_update_keeps_importer_edges(committed):
+    """The watch path is covered above; this is ``update`` after ``git rm``."""
+    repo, store = committed
+    anchor = store.get_metadata('git_head_sha')
+    _git(repo, 'rm', '-q', 'fee.ts')
+    _git(repo, 'commit', '-qm', 'drop fee')
+
+    result = incremental_update(repo, store, base=anchor)
+
+    assert not result['errors']
+    _assert_matches_full_build(repo, store)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='The seed hash is stored even when a forced dependent fails to parse; '
+           'the next update sees the seed as a replay and never retries the dependent.',
+)
+def test_failed_dependent_reparse_is_retried_by_the_next_update(committed, monkeypatch):
+    repo, store = committed
+    monkeypatch.setenv('CRG_SERIAL_PARSE', '1')
+    _rename(repo, RENAMED)
+    blocked = (repo / 'use.ts').resolve()
+    real_read_bytes = Path.read_bytes
+
+    def flaky_read_bytes(self):
+        if self.resolve() == blocked:
+            raise PermissionError(13, 'Permission denied', str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', flaky_read_bytes)
+    first = incremental_update(repo, store, changed_files=list(RENAMED), reconcile_stale=False)
+    assert [e['file'] for e in first['errors']] == ['use.ts']
+
+    monkeypatch.setattr(Path, 'read_bytes', real_read_bytes)
+    incremental_update(repo, store, base=store.get_metadata('git_head_sha'))
+
+    _assert_matches_full_build(repo, store)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='The dependents check hashes every changed path, including files the '
+           'graph does not hold (binaries, assets, ignored paths), so `update` reads '
+           'them whole. Hash only when the graph has nodes for the path.',
+)
+def test_unindexed_changed_file_is_not_read(committed, monkeypatch):
+    """A committed binary asset is listed by git but was never read before this change."""
+    repo, store = committed
+    blob = repo / 'assets' / 'model.bin'
+    blob.parent.mkdir()
+    blob.write_bytes(b'\x00\x01' * 4096)
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self):
+        reads.append(Path(self).name)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', counting_read_bytes)
+    result = incremental_update(
+        repo, store, changed_files=['assets/model.bin'], reconcile_stale=False,
+    )
+
+    assert not result['errors']
+    assert result['files_updated'] == 0
+    assert 'model.bin' not in reads
