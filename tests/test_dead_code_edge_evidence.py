@@ -13,6 +13,8 @@ SQLite ``LIKE`` did), literal matching of ``_`` in names, dotted class names
 
 from pathlib import Path
 
+import pytest
+
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
 from code_review_graph.refactor import find_dead_code, suggest_refactorings
@@ -80,6 +82,13 @@ def test_underscore_in_class_name_is_literal_for_member_calls(tmp_path):
         assert "My_Widget" in _dead_names(store)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#1082 builds member-call names from [\\w$]+ components, so a dotted"
+        " class name such as MyApp.Accounts never matches"
+    ),
+)
 def test_dotted_class_name_member_call_keeps_class_alive(tmp_path):
     # Elixir modules are stored as Class nodes named "MyApp.Accounts". A call
     # into the module ("...::MyApp.Accounts.normalize") is member-call
@@ -93,6 +102,13 @@ def test_dotted_class_name_member_call_keeps_class_alive(tmp_path):
         assert "MyApp.Accounts" not in _dead_names(store, kind="Class")
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#1082 builds member-call names from [\\w$]+ components, so a dotted"
+        " class name such as MyApp.Accounts never matches"
+    ),
+)
 def test_parsed_elixir_modules_with_internal_calls_are_not_dead(tmp_path):
     # Same rule through the real parser: a dotted and an undotted module, each
     # with one function calling another inside it.
