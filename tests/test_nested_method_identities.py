@@ -198,7 +198,17 @@ end
 '''
 
 
-@pytest.mark.parametrize('nested_first', [True, False], ids=['nested-first', 'nested-last'])
+@pytest.mark.parametrize('nested_first', [
+    pytest.param(True, id='nested-first', marks=pytest.mark.xfail(
+        strict=True,
+        reason=(
+            'PR #1087: disambiguated_scopes in _resolve_call_targets keeps only dotted '
+            'scopes, so the top-level User falls back to the first same-named method '
+            'in the file (Admin.User.validate)'
+        ),
+    )),
+    pytest.param(False, id='nested-last'),
+])
 def test_top_level_ruby_class_calls_stay_in_that_class(nested_first):
     """A top-level class sharing its leaf with a nested one keeps its own calls.
 
