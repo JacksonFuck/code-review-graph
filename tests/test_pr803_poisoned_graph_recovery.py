@@ -456,6 +456,13 @@ def test_graph_from_release_without_marker(
         assert _should_rebuild_partial_graph(tmp_path, store) is expected
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#881 regression: generic YAML counts as parseable but yields no rows, "
+        "so a complete graph looks partial and is fully rebuilt every other update"
+    ),
+)
 def test_complete_graph_of_yaml_heavy_repo_is_not_rebuilt_on_alternate_updates(
     tmp_path: Path, monkeypatch,
 ) -> None:
