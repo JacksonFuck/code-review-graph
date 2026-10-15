@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -502,10 +503,9 @@ class TestExtendsAnchoringEdgeCases:
 
     @pytest.mark.parametrize("child_options", [
         {"baseUrl": 1},
-        {"baseUrl": None},
         [],
         "not-an-object",
-    ], ids=["int-baseUrl", "null-baseUrl", "list-options", "string-options"])
+    ], ids=["int-baseUrl", "list-options", "string-options"])
     def test_malformed_child_options_never_raise(self, tmp_path, child_options):
         target = _write_source(tmp_path / "libs" / "shared" / "src" / "index.ts")
         _write_json(tmp_path / "tsconfig.base.json", {
@@ -518,8 +518,9 @@ class TestExtendsAnchoringEdgeCases:
         importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
 
         result = TsconfigResolver().resolve_alias("@acme/shared", str(importer))
-        # tsc rejects these options; the resolver must not crash and must not
-        # point anywhere but the real target.
+        # tsc rejects these options (``"baseUrl": null`` is different: it
+        # unsets the inherited value, see TestExtendsAnchoringMatchesTsc). The
+        # resolver must not crash and must not point anywhere but the target.
         assert result in (None, str(target.resolve()))
 
     def test_deep_extends_chain_keeps_the_root_anchor(self, tmp_path):
@@ -600,3 +601,131 @@ def test_build_and_update_link_imports_through_inherited_paths(tmp_path):
         assert full_build(tmp_path, store)["errors"] == []
         assert raw_alias_edges(store) == 0
     assert importers() == {main.as_posix(), extra.as_posix()}
+
+
+class TestExtendsAnchoringMatchesTsc:
+    """More extends-chain shapes, each checked against tsc 5.9 with
+    ``--traceResolution`` (PR #1111, issue #1110)."""
+
+    def test_inherited_catch_all_paths_resolve_from_the_base(self, tmp_path):
+        # TypeScript 6 deprecates ``baseUrl`` and 7 removes it; the suggested
+        # replacement is a catch-all ``"*": ["./*"]`` in the root base config.
+        target = _write_source(tmp_path / "libs" / "shared" / "src" / "index.ts")
+        _write_json(tmp_path / "tsconfig.base.json", {
+            "compilerOptions": {"paths": {"*": ["./*"]}},
+        })
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "../../tsconfig.base.json",
+        })
+        importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+        resolver = TsconfigResolver()
+
+        assert resolver.resolve_alias("libs/shared/src", str(importer)) == str(
+            target.resolve()
+        )
+        assert resolver.resolve_alias("react", str(importer)) is None
+
+    def test_child_base_url_rebases_paths_the_base_declared_without_base_url(
+        self, tmp_path,
+    ):
+        # A baseUrl anywhere in the chain beats the directory of the config
+        # that declared ``paths``, even when that config set no baseUrl.
+        _write_source(tmp_path / "libs" / "shared" / "index.ts")
+        local = _write_source(
+            tmp_path / "apps" / "api" / "src" / "libs" / "shared" / "index.ts",
+        )
+        _write_json(tmp_path / "tsconfig.base.json", {
+            "compilerOptions": {"paths": {"@acme/shared": ["./libs/shared/index.ts"]}},
+        })
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "../../tsconfig.base.json",
+            "compilerOptions": {"baseUrl": "./src"},
+        })
+        importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+
+        result = TsconfigResolver().resolve_alias("@acme/shared", str(importer))
+        assert result == str(local.resolve())
+
+    def test_two_bases_with_the_same_alias_stay_separate_in_one_resolver(
+        self, tmp_path,
+    ):
+        root_target = _write_source(tmp_path / "libs" / "shared" / "src" / "index.ts")
+        legacy_target = _write_source(tmp_path / "legacy" / "vendor" / "shared.ts")
+        _write_json(tmp_path / "tsconfig.base.json", {
+            "compilerOptions": {"baseUrl": ".", "paths": _SHARED_ALIAS},
+        })
+        _write_json(tmp_path / "legacy" / "tsconfig.base.json", {
+            "compilerOptions": {
+                "baseUrl": ".", "paths": {"@acme/shared": ["vendor/shared.ts"]},
+            },
+        })
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "../../tsconfig.base.json",
+        })
+        _write_json(tmp_path / "legacy" / "apps" / "old" / "tsconfig.json", {
+            "extends": "../../tsconfig.base.json",
+        })
+        api = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+        old = _write_source(tmp_path / "legacy" / "apps" / "old" / "src" / "main.ts")
+        resolver = TsconfigResolver()
+
+        for _ in range(2):
+            assert resolver.resolve_alias("@acme/shared", str(api)) == str(
+                root_target.resolve()
+            )
+            assert resolver.resolve_alias("@acme/shared", str(old)) == str(
+                legacy_target.resolve()
+            )
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "PR #1111 follows the symlink to the extended config's real directory; "
+        "tsc anchors baseUrl/paths where the link sits"
+    ))
+    @pytest.mark.parametrize("shared_options", [
+        {"baseUrl": ".", "paths": {"@app/*": ["src/*"]}},
+        {"paths": {"@app/*": ["./src/*"]}},
+    ], ids=["baseUrl", "paths-only"])
+    def test_symlinked_base_config_anchors_at_the_link_not_its_target(
+        self, tmp_path, shared_options,
+    ):
+        # tsc anchors baseUrl/paths at the path it opened the extended config
+        # through; it does not follow the symlink to the file's real directory.
+        _write_json(tmp_path / "tools" / "tsconfig.shared.json", {
+            "compilerOptions": shared_options,
+        })
+        _write_source(tmp_path / "tools" / "src" / "util.ts")  # beside the real file
+        link = tmp_path / "apps" / "api" / "tsconfig.shared.json"
+        link.parent.mkdir(parents=True)
+        try:
+            os.symlink(os.path.join("..", "..", "tools", "tsconfig.shared.json"), link)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are not available")
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "./tsconfig.shared.json",
+        })
+        util = _write_source(tmp_path / "apps" / "api" / "src" / "util.ts")
+        importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+
+        result = TsconfigResolver().resolve_alias("@app/util", str(importer))
+        assert result == str(util.resolve())
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "PR #1111 keeps the inherited baseUrl anchor when a child sets "
+        "baseUrl to null; tsc unsets it"
+    ))
+    def test_child_null_base_url_unsets_the_inherited_base_url(self, tmp_path):
+        # tsc treats ``null`` in an extending config as "unset the inherited
+        # value": paths then resolve against the config that declared them.
+        _write_source(tmp_path / "base" / "foo.ts")  # where the inherited baseUrl points
+        target = _write_source(tmp_path / "foo.ts")
+        _write_json(tmp_path / "tsconfig.base.json", {
+            "compilerOptions": {"baseUrl": "./base", "paths": {"@x/*": ["./*"]}},
+        })
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "../../tsconfig.base.json",
+            "compilerOptions": {"baseUrl": None},
+        })
+        importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+
+        result = TsconfigResolver().resolve_alias("@x/foo", str(importer))
+        assert result == str(target.resolve())
