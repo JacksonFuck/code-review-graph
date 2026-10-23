@@ -76,9 +76,9 @@ def repo(tmp_path: Path) -> Path:
 def _paths(repo_root: Path) -> dict[str, str]:
     resolved = repo_root.resolve()
     return {
-        "billing": str(resolved / "app/services/billing.py"),
-        "engine": str(resolved / "app/services/engine.py"),
-        "shim": str(resolved / "billing.py"),
+        "billing": (resolved / "app/services/billing.py").as_posix(),
+        "engine": (resolved / "app/services/engine.py").as_posix(),
+        "shim": (resolved / "billing.py").as_posix(),
     }
 
 
@@ -99,7 +99,7 @@ def _resolved_store(repo_root: Path, tmp_path: Path) -> GraphStore:
 
 
 def _edges(store: GraphStore, kind: str, file_path: Path) -> list:
-    wanted = str(file_path.resolve())
+    wanted = str(file_path.resolve().as_posix())
     return [
         e for e in store.get_all_edges()
         if e.kind == kind and e.file_path == wanted
@@ -259,7 +259,7 @@ def test_unfollowable_swap_keeps_the_file_as_the_module(repo, tmp_path, source):
     store = _resolved_store(repo, tmp_path)
     assert {
         e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
-    } == {str(shim.resolve())}
+    } == {str(shim.resolve().as_posix())}
 
 
 def test_shim_cycle_terminates(tmp_path):
@@ -270,7 +270,10 @@ def test_shim_cycle_terminates(tmp_path):
     store = _resolved_store(root, tmp_path)
     targets = {e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)}
     assert len(targets) == 1
-    assert targets <= {str((root / "a.py").resolve()), str((root / "b.py").resolve())}
+    assert targets <= {
+        (root / "a.py").resolve().as_posix(),
+        (root / "b.py").resolve().as_posix(),
+    }
 
 
 # -- build / update parity -----------------------------------------------
@@ -325,7 +328,7 @@ def test_incremental_update_matches_a_rebuild(repo, tmp_path):
     store.close()
 
     paths = _paths(repo)
-    caller = str((repo / "caller.py").resolve())
+    caller = str((repo / "caller.py").resolve().as_posix())
     assert ("CALLS", f"{caller}::go", f"{paths['billing']}::refund", caller) in updated
 
     rebuilt = GraphStore(tmp_path / "rebuild.db")
@@ -366,7 +369,7 @@ def test_literal_swap_overwritten_by_an_unfollowable_one_is_declined(repo, tmp_p
     store = _resolved_store(repo, tmp_path)
     assert {
         e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
-    } == {str(shim.resolve())}
+    } == {str(shim.resolve().as_posix())}
 
 
 def test_star_import_through_a_shim_resolves(repo, tmp_path):
@@ -409,7 +412,7 @@ def test_renamed_reexport_is_never_sent_to_an_unrelated_same_named_function(tmp_
         "def go():\n    pkg.pay(1)\n    pay(2)\n",
     )
     store = _resolved_store(root, tmp_path)
-    unrelated = f"{(root / 'pkg/impl.py').resolve()}::pay"
+    unrelated = f"{(root / 'pkg/impl.py').resolve().as_posix()}::pay"
     assert unrelated not in _call_targets(store, caller)
 
 
@@ -422,7 +425,7 @@ def test_later_unaliased_import_drops_the_earlier_alias(tmp_path):
         "from a import foo as bar\nfrom b import bar\n\n\ndef go():\n    bar()\n",
     )
     store = _resolved_store(root, tmp_path)
-    assert _call_targets(store, caller) == {f"{(root / 'b.py').resolve()}::bar"}
+    assert _call_targets(store, caller) == {f"{(root / 'b.py').resolve().as_posix()}::bar"}
 
 
 @pytest.mark.parametrize(
@@ -446,7 +449,7 @@ def test_import_module_that_is_not_importlibs_is_declined(repo, tmp_path, source
     store = _resolved_store(repo, tmp_path)
     assert {
         e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
-    } == {str(shim.resolve())}
+    } == {str(shim.resolve().as_posix())}
 
 
 @pytest.mark.parametrize(
@@ -470,3 +473,64 @@ def test_importlib_spellings_are_followed(repo, tmp_path, header):
     assert {
         e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
     } == {_paths(repo)["billing"]}
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "import importlib\nimport fake_sys as sys\n",
+        "import importlib\nimport sys\nsys = object()\n",
+    ],
+    ids=["aliased-sys", "rebound-sys"],
+)
+def test_swap_on_something_that_is_not_sys_is_declined(repo, tmp_path, header):
+    shim = _write(
+        repo, "notsys.py",
+        header + "sys.modules[__name__] = importlib.import_module('app.services.billing')\n",
+    )
+    caller = _write(repo, "caller.py", "import notsys\n")
+    store = _resolved_store(repo, tmp_path)
+    assert {
+        e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
+    } == {shim.resolve().as_posix()}
+
+
+def test_submodule_of_a_package_installed_by_a_shim(repo, tmp_path):
+    _write(repo, "app/services/child.py", "def helper():\n    return 1\n")
+    _write(repo, "services.py", SHIM.format(module="app.services"))
+    caller = _write(
+        repo, "caller.py", "from services import child\n\n\ndef go():\n    child.helper()\n",
+    )
+    store = _resolved_store(repo, tmp_path)
+    child = (repo / "app/services/child.py").resolve().as_posix()
+    assert child in {e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)}
+    assert _call_targets(store, caller) == {f"{child}::helper"}
+
+
+def test_symlink_outside_the_repository_is_never_read(tmp_path, monkeypatch):
+    outside = _write(
+        tmp_path / "elsewhere", "linked.py",
+        "import importlib\nimport sys\n\n"
+        "sys.modules[__name__] = importlib.import_module('pkg.real')\n",
+    )
+    root = tmp_path / "repo"
+    _write(root, "pkg/__init__.py", "")
+    _write(root, "pkg/real.py", "def f():\n    return 1\n")
+    try:
+        (root / "pkg/linked.py").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    _write(root, "caller.py", "from pkg import linked\n")
+
+    reads: list[Path] = []
+    original_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(path: Path) -> bytes:
+        if path.resolve() == outside.resolve():
+            reads.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    parser = CodeParser(repo_root=root)
+    parser.parse_file(root / "caller.py")
+    assert reads == []

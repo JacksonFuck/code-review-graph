@@ -15059,7 +15059,20 @@ class CodeParser:
         if module_file in self._python_module_alias_cache:
             return self._python_module_alias_cache[module_file]
         target: Optional[str] = None
-        module_name = self._cached_python_module_alias(Path(module_file))
+        # A repository path can be a symlink to a file elsewhere; only a file
+        # that really lives inside the repository is read.
+        try:
+            real_path = Path(module_file).resolve()
+        except (OSError, ValueError):
+            real_path = None
+        module_name = (
+            self._cached_python_module_alias(real_path)
+            if real_path is not None
+            and self._path_is_within(
+                real_path, self._import_repo_boundary(module_file),
+            )
+            else None
+        )
         if module_name:
             target = self._resolve_python_module_in_repo(module_name, module_file)
         if len(self._python_module_alias_cache) >= self._MODULE_CACHE_MAX:
@@ -15164,9 +15177,12 @@ class CodeParser:
         # The name must mean importlib's function and nothing else: a local
         # `def import_module(...)` or a rebinding of `importlib` makes the
         # call something static analysis cannot vouch for.
-        bindings = CodeParser._python_name_bindings(tree, callee)
-        if not bindings or any(binding != expected for binding in bindings):
-            return None
+        for local, wanted in ((callee, expected), ("sys", ("sys", None))):
+            # `sys` too: `import fake as sys` makes `sys.modules` an ordinary
+            # mapping, and the assignment replaces nothing.
+            bindings = CodeParser._python_name_bindings(tree, local)
+            if not bindings or any(binding != wanted for binding in bindings):
+                return None
         name = call.args[0].value
         if name and not name.startswith("."):
             return name
@@ -15253,10 +15269,21 @@ class CodeParser:
         prefix = module if module.endswith(".") else f"{module}."
         targets: list[str] = [] if namespace else [module]
         if package_dir is not None:
-            targets.extend(
-                f"{prefix}{name}"
-                for name in self._python_submodule_names(node, package_dir)
-            )
+            for name in self._python_submodule_names(node, package_dir):
+                dotted = f"{prefix}{name}"
+                submodule = self._python_submodule_file(package_dir, name)
+                if (
+                    submodule is not None
+                    and file_path
+                    and submodule not in self._excluded_files
+                    and self._resolve_module_to_file(dotted, file_path, "python")
+                    != submodule
+                ):
+                    # `module` is a shim installing another package, so the
+                    # dotted name points under the shim, where no file is.
+                    targets.append(submodule)
+                else:
+                    targets.append(dotted)
         # A namespace package that binds no submodule (only possible for a
         # name that cannot be imported at all) still has to say something.
         return targets or [module]
@@ -15861,6 +15888,10 @@ class CodeParser:
             return None
 
         if language == "python":
+            if Path(module).is_absolute():
+                # A submodule reached through a shim that installs a package
+                # is named by its file; see `_python_from_import_targets`.
+                return self._python_import_origin(module, file_path)
             if module.startswith("."):
                 # Relative import. The leading dots ARE the resolution: one
                 # dot is the caller's own package, each further dot one
