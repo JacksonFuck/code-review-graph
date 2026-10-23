@@ -15149,16 +15149,70 @@ class CodeParser:
         ):
             return None
         func = call.func
-        is_import_module = (
+        expected: tuple[str, Optional[str]]
+        if (
             isinstance(func, ast.Attribute)
             and func.attr == "import_module"
             and isinstance(func.value, ast.Name)
             and func.value.id == "importlib"
-        ) or (isinstance(func, ast.Name) and func.id == "import_module")
+        ):
+            callee, expected = "importlib", ("importlib", None)
+        elif isinstance(func, ast.Name) and func.id == "import_module":
+            callee, expected = "import_module", ("importlib", "import_module")
+        else:
+            return None
+        # The name must mean importlib's function and nothing else: a local
+        # `def import_module(...)` or a rebinding of `importlib` makes the
+        # call something static analysis cannot vouch for.
+        bindings = CodeParser._python_name_bindings(tree, callee)
+        if not bindings or any(binding != expected for binding in bindings):
+            return None
         name = call.args[0].value
-        if is_import_module and name and not name.startswith("."):
+        if name and not name.startswith("."):
             return name
         return None
+
+    @staticmethod
+    def _python_name_bindings(
+        tree: ast.Module, local: str,
+    ) -> list[tuple[str, Optional[str]]]:
+        """How *local* is bound anywhere in *tree*, one entry per binding.
+
+        An import binding is ``(module, imported name)``: ``import importlib``
+        gives ``("importlib", None)`` and ``from importlib import
+        import_module`` gives ``("importlib", "import_module")``. Any other
+        binding (def, class, assignment, loop or ``with`` target, ``global``)
+        is ``("", None)``, which matches no expected import.
+        """
+        bindings: list[tuple[str, Optional[str]]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname is not None:
+                        if alias.asname == local:
+                            bindings.append((alias.name, None))
+                    elif alias.name.split(".")[0] == local:
+                        # `import importlib.util` binds `importlib` itself.
+                        bindings.append((local, None))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == local:
+                        module = node.module if not node.level else ""
+                        bindings.append((module or "", alias.name))
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                if node.name == local:
+                    bindings.append(("", None))
+            elif isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del),
+            ):
+                if node.id == local:
+                    bindings.append(("", None))
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                if local in node.names:
+                    bindings.append(("", None))
+        return bindings
 
     def _python_submodule_names(
         self, node, package_dir: Path,

@@ -423,3 +423,50 @@ def test_later_unaliased_import_drops_the_earlier_alias(tmp_path):
     )
     store = _resolved_store(root, tmp_path)
     assert _call_targets(store, caller) == {f"{(root / 'b.py').resolve()}::bar"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a local function shadows importlib's
+        "import sys\n\n\ndef import_module(name):\n    return sys.modules[__name__]\n\n\n"
+        "sys.modules[__name__] = import_module('app.services.billing')\n",
+        # `importlib` rebound to something else
+        "import sys\nimport importlib\nimportlib = object()\n"
+        "sys.modules[__name__] = importlib.import_module('app.services.billing')\n",
+        # bare call with no import at all
+        "import sys\n"
+        "sys.modules[__name__] = import_module('app.services.billing')\n",
+    ],
+    ids=["local-def", "rebound-importlib", "unbound"],
+)
+def test_import_module_that_is_not_importlibs_is_declined(repo, tmp_path, source):
+    shim = _write(repo, "fake.py", source)
+    caller = _write(repo, "caller.py", "import fake\n")
+    store = _resolved_store(repo, tmp_path)
+    assert {
+        e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
+    } == {str(shim.resolve())}
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "from importlib import import_module\nimport sys\n",
+        "import importlib.util\nimport sys\n",
+    ],
+    ids=["from-importlib", "dotted-import"],
+)
+def test_importlib_spellings_are_followed(repo, tmp_path, header):
+    call = (
+        "import_module" if "from importlib" in header else "importlib.import_module"
+    )
+    _write(
+        repo, "spelled.py",
+        header + f"sys.modules[__name__] = {call}('app.services.billing')\n",
+    )
+    caller = _write(repo, "caller.py", "import spelled\n")
+    store = _resolved_store(repo, tmp_path)
+    assert {
+        e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
+    } == {_paths(repo)["billing"]}
