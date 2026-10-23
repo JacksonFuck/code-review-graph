@@ -14686,7 +14686,9 @@ class CodeParser:
             if module_node is None:
                 continue
             module = module_node.text.decode("utf-8", errors="replace")
-            resolved = self._resolve_python_module_in_repo(module, file_path)
+            # `_python_import_origin` sees through sys.modules shims, so
+            # `from shim import *` enumerates the real module's exports.
+            resolved = self._python_import_origin(module, file_path)
             if resolved is None or resolved in resolving:
                 continue
             for name, origin in self._get_python_star_exports(
@@ -14764,6 +14766,13 @@ class CodeParser:
                 tree.root_node, resolved_module, origins, next_resolving,
             )
             for name, module in import_map.items():
+                if f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{name}" in import_map:
+                    # `from .impl import charge as pay` exports `pay`, but the
+                    # origin file defines `charge`; an origin keyed by file
+                    # alone would send `pkg.pay` to an unrelated `impl.pay`.
+                    # Keep the name on this module, where it stays unresolved.
+                    origins[name] = resolved_module
+                    continue
                 # A relative import stores its already-resolved file here,
                 # an absolute one a dotted module name; both must work.
                 origin = self._python_import_origin(module, resolved_module)
@@ -15082,8 +15091,10 @@ class CodeParser:
         Only the literal, module-level form counts:
         ``sys.modules[__name__] = importlib.import_module("dotted.name")``
         (or ``import_module(...)`` imported from ``importlib``). A computed or
-        relative module name, or a swap inside a function or ``if`` block, is
-        not something static analysis can follow, so the file stays the module.
+        relative module name, a swap inside a function or ``if`` block, or a
+        later write that replaces the literal swap is not something static
+        analysis can follow, so the file stays the module. Of several
+        module-level swaps the last one is what importers get.
         """
         try:
             source = module_path.read_bytes()
@@ -15095,14 +15106,9 @@ class CodeParser:
             tree = ast.parse(source)
         except (SyntaxError, ValueError):
             return None
-        for statement in tree.body:
-            if not (
-                isinstance(statement, ast.Assign)
-                and len(statement.targets) == 1
-            ):
-                continue
-            target = statement.targets[0]
-            if not (
+
+        def writes_own_entry(target: ast.AST) -> bool:
+            return (
                 isinstance(target, ast.Subscript)
                 and isinstance(target.value, ast.Attribute)
                 and target.value.attr == "modules"
@@ -15110,27 +15116,48 @@ class CodeParser:
                 and target.value.value.id == "sys"
                 and isinstance(target.slice, ast.Name)
                 and target.slice.id == "__name__"
-            ):
+            )
+
+        # Importers get the LAST value written, so every write counts: a
+        # second swap, one nested in a block, or a computed one means the
+        # module that answers the import is not provable from the source.
+        top_level = {id(statement) for statement in tree.body}
+        writes: list[ast.stmt] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            else:
                 continue
-            call = statement.value
-            if not (
-                isinstance(call, ast.Call)
-                and len(call.args) == 1
-                and not call.keywords
-                and isinstance(call.args[0], ast.Constant)
-                and isinstance(call.args[0].value, str)
-            ):
-                continue
-            func = call.func
-            is_import_module = (
-                isinstance(func, ast.Attribute)
-                and func.attr == "import_module"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "importlib"
-            ) or (isinstance(func, ast.Name) and func.id == "import_module")
-            name = call.args[0].value
-            if is_import_module and name and not name.startswith("."):
-                return name
+            if any(writes_own_entry(target) for target in targets):
+                if id(node) not in top_level:
+                    return None
+                writes.append(node)
+        if not writes:
+            return None
+        final = max(writes, key=lambda node: (node.lineno, node.col_offset))
+        if not (isinstance(final, ast.Assign) and len(final.targets) == 1):
+            return None
+        call = final.value
+        if not (
+            isinstance(call, ast.Call)
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            return None
+        func = call.func
+        is_import_module = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "import_module"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "importlib"
+        ) or (isinstance(func, ast.Name) and func.id == "import_module")
+        name = call.args[0].value
+        if is_import_module and name and not name.startswith("."):
+            return name
         return None
 
     def _python_submodule_names(
@@ -15479,14 +15506,20 @@ class CodeParser:
                             import_map[
                                 f"{_PY_MODULE_BINDING_KEY}{local_name}"
                             ] = target
+                            import_map.pop(
+                                f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}",
+                                None,
+                            )
                             return
                     import_map[local_name] = module
+                    original_key = f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
                     if imported_name != local_name:
                         # `from X import A as B; B()` calls X's `A`; without
                         # the original name the call qualified as `X::B`.
-                        import_map[
-                            f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
-                        ] = imported_name
+                        import_map[original_key] = imported_name
+                    else:
+                        # A later `from Y import B` rebinds B to Y's own `B`.
+                        import_map.pop(original_key, None)
 
                 seen_import_keyword = False
                 for child in node.children:

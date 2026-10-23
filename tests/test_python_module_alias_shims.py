@@ -335,3 +335,91 @@ def test_incremental_update_matches_a_rebuild(repo, tmp_path):
         assert _edge_rows(rebuilt) == updated
     finally:
         rebuilt.close()
+
+
+# -- review follow-ups ------------------------------------------------------
+
+
+def test_last_of_several_swaps_wins(repo, tmp_path):
+    _write(
+        repo, "twice.py",
+        "import importlib\nimport sys\n\n"
+        'sys.modules[__name__] = importlib.import_module("app.services.engine")\n'
+        'sys.modules[__name__] = importlib.import_module("app.services.billing")\n',
+    )
+    caller = _write(repo, "caller.py", "import twice\n")
+    store = _resolved_store(repo, tmp_path)
+    assert {
+        e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
+    } == {_paths(repo)["billing"]}
+
+
+def test_literal_swap_overwritten_by_an_unfollowable_one_is_declined(repo, tmp_path):
+    shim = _write(
+        repo, "overwritten.py",
+        "import importlib\nimport sys\n\n"
+        'sys.modules[__name__] = importlib.import_module("app.services.billing")\n'
+        "name = 'app.services.engine'\n"
+        "sys.modules[__name__] = importlib.import_module(name)\n",
+    )
+    caller = _write(repo, "caller.py", "import overwritten\n")
+    store = _resolved_store(repo, tmp_path)
+    assert {
+        e.target_qualified for e in _edges(store, "IMPORTS_FROM", caller)
+    } == {str(shim.resolve())}
+
+
+def test_star_import_through_a_shim_resolves(repo, tmp_path):
+    caller = _write(
+        repo, "caller.py",
+        "from billing import *\n\n\ndef go():\n    charge(1)\n    run_model(2)\n",
+    )
+    store = _resolved_store(repo, tmp_path)
+    paths = _paths(repo)
+    assert _call_targets(store, caller) == {
+        f"{paths['billing']}::charge",
+        f"{paths['engine']}::run_model",
+    }
+
+
+def test_recursive_star_import_through_a_shim_resolves(repo, tmp_path):
+    _write(repo, "facade.py", "from billing import *\n")
+    caller = _write(
+        repo, "caller.py",
+        "from facade import *\n\n\ndef go():\n    charge(1)\n    run_model(2)\n",
+    )
+    store = _resolved_store(repo, tmp_path)
+    paths = _paths(repo)
+    assert _call_targets(store, caller) == {
+        f"{paths['billing']}::charge",
+        f"{paths['engine']}::run_model",
+    }
+
+
+def test_renamed_reexport_is_never_sent_to_an_unrelated_same_named_function(tmp_path):
+    root = tmp_path / "repo"
+    _write(
+        root, "pkg/impl.py",
+        "def charge(x):\n    return x\n\n\ndef pay(x):\n    return -x\n",
+    )
+    _write(root, "pkg/__init__.py", "from .impl import charge as pay\n")
+    caller = _write(
+        root, "caller.py",
+        "import pkg\nfrom pkg import pay\n\n\n"
+        "def go():\n    pkg.pay(1)\n    pay(2)\n",
+    )
+    store = _resolved_store(root, tmp_path)
+    unrelated = f"{(root / 'pkg/impl.py').resolve()}::pay"
+    assert unrelated not in _call_targets(store, caller)
+
+
+def test_later_unaliased_import_drops_the_earlier_alias(tmp_path):
+    root = tmp_path / "repo"
+    _write(root, "a.py", "def foo():\n    return 1\n")
+    _write(root, "b.py", "def bar():\n    return 2\n\n\ndef foo():\n    return 3\n")
+    caller = _write(
+        root, "caller.py",
+        "from a import foo as bar\nfrom b import bar\n\n\ndef go():\n    bar()\n",
+    )
+    store = _resolved_store(root, tmp_path)
+    assert _call_targets(store, caller) == {f"{(root / 'b.py').resolve()}::bar"}
