@@ -78,6 +78,13 @@ _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
 
+# ``{(module file, mtime, size): dotted module it installs as
+# sys.modules[__name__], or None}``. Process-wide like the star-export cache,
+# so parse workers and concurrent parsers read each module for this at most
+# once. See :meth:`CodeParser._python_module_alias`.
+_PYTHON_MODULE_ALIAS_CACHE: dict[tuple[str, int, int], Optional[str]] = {}
+_PYTHON_MODULE_ALIAS_CACHE_LOCK = threading.Lock()
+
 # ``{module file: {top-level def name: return annotation text}}``, keyed by
 # the module's mtime and size the way the star-export cache is. Only the text
 # of an annotation the module actually wrote is stored; nothing is inferred
@@ -2985,6 +2992,10 @@ class CodeParser:
         # (module file, symbol) -> file that really defines the symbol; see
         # :meth:`_python_reexport_origin`.
         self._python_reexport_cache: dict[str, str] = {}
+        # Python module file -> file of the module it installs in its place
+        # via ``sys.modules[__name__] = ...`` (None when it is not a shim);
+        # see :meth:`_python_module_alias_target`.
+        self._python_module_alias_cache: dict[str, Optional[str]] = {}
         # Absolute file paths to treat as absent during import resolution.
         # ``forget`` sets this (via :meth:`exclude_files`) so a re-parsed
         # referrer resolves exactly as it would in a build where the forgotten
@@ -6992,8 +7003,8 @@ class CodeParser:
                 return attribute.text.decode("utf-8", errors="replace")
         return None
 
-    @staticmethod
     def _apply_python_receiver_evidence(
+        self,
         edges: list[EdgeInfo],
         evidence: dict[tuple[int, str], tuple[str, str]],
     ) -> list[EdgeInfo]:
@@ -7021,7 +7032,14 @@ class CodeParser:
             extra = dict(edge.extra)
             extra["receiver_binding"] = kind
             if kind == "module":
-                extra["receiver_module"] = detail
+                # `pkg.func()` where `pkg` only re-exports `func` is a call
+                # into the file that defines it; the resolver looks for the
+                # name at top level of `receiver_module`.
+                extra["receiver_module"] = (
+                    self._python_reexport_origin(detail, edge.target)
+                    if detail
+                    else detail
+                )
             elif kind == "class":
                 extra["receiver_class"] = detail
             annotated.append(EdgeInfo(
@@ -14987,7 +15005,132 @@ class CodeParser:
             package_dir / f"{name}.py",
         ):
             if self._file_exists_exact(candidate):
-                return normalize_file_path(candidate)
+                return self._python_module_alias_target(
+                    normalize_file_path(candidate),
+                )
+        return None
+
+    # Shims that re-point each other are followed at most this many hops.
+    _PY_MODULE_ALIAS_MAX_DEPTH = 5
+
+    def _python_module_alias_target(self, module_file: str) -> str:
+        """The module that really answers an import of *module_file*.
+
+        A compatibility shim such as::
+
+            import importlib, sys
+            sys.modules[__name__] = importlib.import_module("pkg.real")
+
+        swaps itself out of ``sys.modules`` on first import, so ``import shim``
+        hands the caller ``pkg/real.py``. Treating the five-line shim as the
+        module left every ``shim.func()`` without a definition to land on and
+        recorded the shim as the file importers depend on. Follows chains of
+        shims; returns *module_file* unchanged for an ordinary module, a
+        target outside the repository, or a target excluded via
+        :meth:`exclude_files` (a build without that file would not see it).
+        """
+        current = module_file
+        seen = {current}
+        for _ in range(self._PY_MODULE_ALIAS_MAX_DEPTH):
+            target = self._python_module_alias(current)
+            if (
+                target is None
+                or target in seen
+                or target in self._excluded_files
+            ):
+                break
+            seen.add(target)
+            current = target
+        return current
+
+    def _python_module_alias(self, module_file: str) -> Optional[str]:
+        """One hop of :meth:`_python_module_alias_target`, cached per file."""
+        if not module_file.endswith(".py"):
+            return None
+        if module_file in self._python_module_alias_cache:
+            return self._python_module_alias_cache[module_file]
+        target: Optional[str] = None
+        module_name = self._cached_python_module_alias(Path(module_file))
+        if module_name:
+            target = self._resolve_python_module_in_repo(module_name, module_file)
+        if len(self._python_module_alias_cache) >= self._MODULE_CACHE_MAX:
+            self._python_module_alias_cache.clear()
+        self._python_module_alias_cache[module_file] = target
+        return target
+
+    @classmethod
+    def _cached_python_module_alias(cls, module_path: Path) -> Optional[str]:
+        """:meth:`_read_python_module_alias`, cached by the file's mtime and size."""
+        try:
+            file_stat = module_path.stat()
+        except (OSError, ValueError):
+            return None
+        cache_key = (str(module_path), file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_MODULE_ALIAS_CACHE_LOCK:
+            if cache_key in _PYTHON_MODULE_ALIAS_CACHE:
+                return _PYTHON_MODULE_ALIAS_CACHE[cache_key]
+            module_name = cls._read_python_module_alias(module_path)
+            if len(_PYTHON_MODULE_ALIAS_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                _PYTHON_MODULE_ALIAS_CACHE.clear()
+            _PYTHON_MODULE_ALIAS_CACHE[cache_key] = module_name
+            return module_name
+
+    @staticmethod
+    def _read_python_module_alias(module_path: Path) -> Optional[str]:
+        """Dotted module a file installs as ``sys.modules[__name__]``, if any.
+
+        Only the literal, module-level form counts:
+        ``sys.modules[__name__] = importlib.import_module("dotted.name")``
+        (or ``import_module(...)`` imported from ``importlib``). A computed or
+        relative module name, or a swap inside a function or ``if`` block, is
+        not something static analysis can follow, so the file stays the module.
+        """
+        try:
+            source = module_path.read_bytes()
+        except OSError:
+            return None
+        if b"sys.modules" not in source or b"import_module" not in source:
+            return None
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            return None
+        for statement in tree.body:
+            if not (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+            ):
+                continue
+            target = statement.targets[0]
+            if not (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "modules"
+                and isinstance(target.value.value, ast.Name)
+                and target.value.value.id == "sys"
+                and isinstance(target.slice, ast.Name)
+                and target.slice.id == "__name__"
+            ):
+                continue
+            call = statement.value
+            if not (
+                isinstance(call, ast.Call)
+                and len(call.args) == 1
+                and not call.keywords
+                and isinstance(call.args[0], ast.Constant)
+                and isinstance(call.args[0].value, str)
+            ):
+                continue
+            func = call.func
+            is_import_module = (
+                isinstance(func, ast.Attribute)
+                and func.attr == "import_module"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "importlib"
+            ) or (isinstance(func, ast.Name) and func.id == "import_module")
+            name = call.args[0].value
+            if is_import_module and name and not name.startswith("."):
+                return name
         return None
 
     def _python_submodule_names(
@@ -15057,11 +15200,12 @@ class CodeParser:
             if not self._path_is_within(resolved, boundary):
                 return None
             return (
-                normalize_file_path(resolved)
+                self._python_module_alias_target(normalize_file_path(resolved))
                 if self._file_exists_exact(resolved)
                 else None
             )
-        return self._resolve_python_module_in_repo(module, file_path)
+        origin = self._resolve_python_module_in_repo(module, file_path)
+        return self._python_module_alias_target(origin) if origin else None
 
     def _python_module_search(
         self, module: str, file_path: str,
@@ -15337,6 +15481,12 @@ class CodeParser:
                             ] = target
                             return
                     import_map[local_name] = module
+                    if imported_name != local_name:
+                        # `from X import A as B; B()` calls X's `A`; without
+                        # the original name the call qualified as `X::B`.
+                        import_map[
+                            f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
+                        ] = imported_name
 
                 seen_import_keyword = False
                 for child in node.children:
@@ -15526,6 +15676,7 @@ class CodeParser:
         # Drop resolutions cached before the exclusions were applied.
         self._module_file_cache.clear()
         self._python_reexport_cache.clear()
+        self._python_module_alias_cache.clear()
 
     def _resolve_module_to_file(
         self,
@@ -15562,6 +15713,8 @@ class CodeParser:
             self._module_file_cache[cache_key] = resolved
         if resolved is not None and resolved in self._excluded_files:
             return None
+        if resolved is not None and language == "python":
+            resolved = self._python_module_alias_target(resolved)
         return resolved
 
     def _do_resolve_module(
